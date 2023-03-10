@@ -1,66 +1,56 @@
+from flask import Flask, request
 import tweepy
-import requests
-from bs4 import BeautifulSoup
-import time
 import os
-from flask import Flask, render_template, request, redirect
+import pymongo
+from bson.json_util import dumps
+import feedparser
 
-# Twitter API credentials
+# Authenticate with Twitter API
+auth = tweepy.OAuthHandler(os.environ['CONSUMER_KEY'], os.environ['CONSUMER_SECRET'])
+auth.set_access_token(os.environ['ACCESS_TOKEN'], os.environ['ACCESS_TOKEN_SECRET'])
+api = tweepy.API(auth)
 
-consumer_key=os.getenv('CONSUMER_KEY')
-consumer_secret=os.getenv('CONSUMER_SECRET')
-access_key=os.getenv('ACCESS_KEY')
-access_secret=os.getenv('ACCESS_SECRET')
+app=Flask(__name__)
 
-# Twitter API setup and authentication
+# Connect to MongoDB
+mongo_client = pymongo.MongoClient(os.environ['MONGODB_URI'])
+db = mongo_client[os.environ['MONGODB_DB']]
+tweets_collection = db['tweets']
 
-auth=tweepy.OAuthHandler(consumer_key, consumer_secret)
-auth.set_access_token(access_key, access_secret)
-api=tweepy.API(auth)
+# Define function to get latest tweets with a given keyword
+def get_latest_tweet(keyword):
+    tweets = api.search(q=keyword, lang='en', result_type='recent', count=1)
+    return tweets[0]
 
-app = Flask(__name__)
+# Define function to handle mentions
+def handle_mentions():
+    mentions = api.mentions_timeline(count=10)
+    for mention in mentions:
+        if mention.in_reply_to_status_id is not None:
+            continue
+        if 'keywords' in mention.text.lower():
+            keywords = mention.text.lower().split('keywords ')[1]
+            latest_tweet = get_latest_tweet(keywords)
+            # Save tweet to MongoDB
+            tweets_collection.insert_one(latest_tweet._json)
+            api.update_status('@' + mention.user.screen_name + ' ' + latest_tweet.text, in_reply_to_status_id=mention.id)
 
-
-#Home Route
-@app.route('/')
-def index():
-    return 'Setting up the Twitter bot'
-
-#retrieves mention data from twitter
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    #retrieve the mention data from twitter
-    data=request.get_json()
-    text=data['text'].lower()
-    username=data['user']['screen_name']
-    mention_id=data['id_str']
-    print(text)
-
-    if '@bugzerobot' in text and ('hacker' in text or 'cybersecurity' in text):
-        #scrapping the data from twitter for the latest news with the keyword 'hacker' or 'cybersecurity'
-        query = 'hacker' if 'hacker' in text else 'cybersecurity'
-        tweets=api.search_tweets(query, + ' -filter:retweets', lang='en', result_type='recent', count=5)
-        #creating a list of tweets
-        news=[]
-        for tweet in tweets:
-            text=tweet.text.strip()
-            link='https://twitter.com/'+tweet.user.screen_name+'/status/'+tweet.id_str
-
-            news.append({'text':text, 'link':link})
-
-        #creating a string of tweets
-        news_string=''
-        for i in range(len(news)):
-            news_string+=str(i+1)+'. '+news[i]['text']+' '+news[i]['link']+' '
-
-        #replying to the mention with the latest news
-        api.update_status('@' + username + ' Here are the latest news on ' + query + ':', mention_id)
-        for article in news:
-            api.update_status(article['text'] + ' ' + article['link'], mention_id)
-        
-    return 'success', 200
+# Define endpoint for periodic news updates
+@app.route('/news-update')
+def news_update():
+    # Get latest news from RSS feed
+    rss_feed = 'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml' # Change this to your RSS feed
+    feed = feedparser.parse(rss_feed)
+    latest_news_title = feed.entries[0].title
+    latest_news_link = feed.entries[0].link
+    latest_news = f'{latest_news_title}\n{latest_news_link}\n\n'
+    
+    # Save news to MongoDB
+    news_tweet = api.update_status('Cybersecurity news update:\n' + latest_news)
+    tweets_collection.insert_one(news_tweet._json)
+    return 'News update posted!'
 
 if __name__ == '__main__':
+    app = Flask(__name__)
     app.run(debug=True)
-
 
